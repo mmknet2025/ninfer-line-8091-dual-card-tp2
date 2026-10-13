@@ -82,6 +82,36 @@ void run() {
     require(!bit(plane, '9'), "grammar must reject a bare digit at the root");
     require(!bit(plane, 256), "grammar must reject EOS at the root");
 
+    // The live serve shape: a reasoning harness wraps the schema root, so the constrained span
+    // starts with the reasoning close. The producer must still publish a non-empty column 0 --
+    // the sampler's only defence against an empty support is that this can never happen.
+    StructuredOutputEnvelope reasoning_envelope;
+    reasoning_envelope.reasoning_close = "</think>";
+    {
+        auto reasoned =
+            compiler.compile({StructuredOutputKind::JsonSchema, schema}, reasoning_envelope);
+        std::vector<std::uint32_t> column(kWords, 0);
+        reasoned->fill_masks(column, {});
+        require(bit_count(column, kVocab) > 0, "the reasoned envelope left column 0 empty");
+        // Inside reasoning the model may still open the object directly, which is what the live
+        // request does: emit the JSON after closing the think block.
+        require(bit(column, '{') || bit(column, ' '),
+                "the reasoned envelope admits no continuation");
+    }
+    {
+        // A const schema is the narrowest root a request can ask for: the whole value is fixed,
+        // so its first column is a handful of tokens -- exactly the state the sampler mishandled.
+        auto forced = compiler.compile({StructuredOutputKind::JsonSchema,
+                                        R"({"const":{"forced":"x","n":17}})"},
+                                       StructuredOutputEnvelope{});
+        std::vector<std::uint32_t> column(kWords, 0);
+        forced->fill_masks(column, {});
+        require(bit(column, '{'), "a const object root must permit its own first token");
+        require(bit_count(column, kVocab) > 0, "a const root left column 0 empty");
+        require(bit_count(column, kVocab) < static_cast<std::size_t>(kVocab),
+                "a const root must restrict the vocabulary");
+    }
+
     // `{"a":` is committed: the legality of individual tokens must have moved with it.
     std::vector<TokenId> committed;
     for (unsigned char ch : std::string("{\"a\":")) { committed.push_back(ch); }

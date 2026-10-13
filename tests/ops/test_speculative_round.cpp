@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -123,13 +124,21 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
                         const std::vector<std::int32_t>& drafts, std::int32_t initial_length,
                         int token_domain, ops::SamplingConfig config,
                         const std::vector<std::int32_t>& initial_token_counts,
-                        const AcceptExpected& expected) {
+                        const AcceptExpected& expected,
+                        const std::vector<std::uint32_t>& token_mask = {}) {
     const int k              = static_cast<int>(drafts.size());
     DeviceBuffer d_targets   = to_device(target_tokens);
     DeviceBuffer d_logits    = to_device(logits_bits);
     DeviceBuffer d_drafts    = to_device(drafts);
     DeviceBuffer d_counts    = to_device(initial_token_counts);
     config.token_counts      = static_cast<std::int32_t*>(d_counts.p);
+    std::unique_ptr<GuardedDeviceBuffer> d_mask;
+    if (!token_mask.empty()) {
+        d_mask = std::make_unique<GuardedDeviceBuffer>(token_mask.size() * sizeof(std::uint32_t));
+        d_mask->copy_from_host(token_mask.data(), token_mask.size() * sizeof(std::uint32_t));
+        config.token_mask        = static_cast<const std::uint32_t*>(d_mask->data());
+        config.token_mask_stride = static_cast<std::int32_t>(token_mask.size());
+    }
     DeviceBuffer d_config    = device_config(config);
     const auto config_before = from_device<std::uint8_t>(d_config, sizeof(ops::SamplingConfig));
 
@@ -231,6 +240,43 @@ int greedy_accept_case(int k, int accepted_count, int token_domain = 64) {
                                    " A=" + std::to_string(accepted_count),
                                targets, logits, token_domain, drafts, initial_length, token_domain,
                                ops::SamplingConfig{}, token_counts, expected);
+}
+
+int greedy_masked_accept_case(int token_domain, int k) {
+    // The verify forward's own argmax (`target_tokens`) is taken over the whole vocabulary and a
+    // constrained-decoding mask does not touch it: here it names token 7, which the grammar
+    // forbids. The draft the proposal head produced is the same token, so a mask-blind commit
+    // would accept drafts[0] and license it. The round must instead take the argmax over the
+    // column's ADMISSIBLE tokens -- 100 at column 0 -- and reject the draft.
+    constexpr std::int32_t kBlind = 7;   // vocabulary-wide argmax, inadmissible
+    constexpr std::int32_t kLegal = 100; // admissible argmax of every column
+    std::vector<std::int32_t> targets(static_cast<std::size_t>(k + 1), kBlind);
+    std::vector<std::int32_t> drafts(static_cast<std::size_t>(k), kBlind);
+
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(token_domain) * (k + 1));
+    for (int column = 0; column <= k; ++column) {
+        const std::size_t base = static_cast<std::size_t>(column) * token_domain;
+        for (int v = 0; v < token_domain; ++v) {
+            float value = 0.0f;
+            if (v == kBlind) { value = 8.0f; }
+            if (v == kLegal) { value = 6.0f; }
+            if (v == kLegal + 1) { value = 5.0f; }
+            logits[base + static_cast<std::size_t>(v)] = f32_to_bf16(value);
+        }
+    }
+    std::vector<std::uint32_t> mask(static_cast<std::size_t>((token_domain + 31) / 32), 0U);
+    for (const std::int32_t token : {kLegal, kLegal + 1}) {
+        mask[static_cast<std::size_t>(token) / 32U] |= (1U << (token % 32));
+    }
+
+    const std::int32_t initial_length = 300;
+    const auto expected               = accept_state_oracle(drafts, /*accepted=*/0,
+                                                            /*terminal_token=*/kLegal, initial_length);
+    std::vector<std::int32_t> token_counts(static_cast<std::size_t>(token_domain), 0);
+    return execute_accept_case("speculative greedy masked token_domain=" +
+                                   std::to_string(token_domain) + " K=" + std::to_string(k),
+                               targets, logits, token_domain, drafts, initial_length, token_domain,
+                               ops::SamplingConfig{}, token_counts, expected, mask);
 }
 
 int deterministic_sampling_case() {
@@ -439,6 +485,12 @@ int main() {
     failures += greedy_accept_case(5, 2);
     failures += greedy_accept_case(5, 5);
     failures += greedy_accept_case(15, 7, 257);
+    // Both verify routes: the single block owns token_domain <= 256, the partial/group pipeline
+    // owns the production vocabulary.
+    failures += greedy_masked_accept_case(128, 1);
+    failures += greedy_masked_accept_case(128, 5);
+    failures += greedy_masked_accept_case(512, 1);
+    failures += greedy_masked_accept_case(512, 5);
     failures += deterministic_sampling_case();
     failures += batched_sampling_workspace_stride_case();
     failures += select_hidden_case(5120, 6, 0);

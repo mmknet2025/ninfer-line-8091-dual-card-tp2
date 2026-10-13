@@ -48,7 +48,11 @@ __launch_bounds__(kSamplerBlock) __global__
             }
             __syncthreads();
         }
-        if (tid == 0) { out[row] = red_idx[0]; }
+        if (tid == 0) {
+            // red_idx[0] is only left at its sentinel when every candidate was inadmissible, which
+            // the mask producer rejects before launch; report it instead of licensing a token.
+            out[row] = red_idx[0] == INT_MAX ? kSamplerNonFiniteToken : red_idx[0];
+        }
         return;
     }
 
@@ -80,15 +84,21 @@ __launch_bounds__(kSamplerBlock) __global__
     const float u     = sampling_uniform(cfg.seed, logical_positions[row], purpose, 0u);
     float acc         = 0.0f;
     int picked        = cand_idx[support - 1];
+    float picked_val  = cand_val[support - 1];
     for (int j = 0; j < support; ++j) {
         acc += prob[j]; // prob is normalized: goal == u
         if (u < acc) {
-            picked = cand_idx[j];
+            picked     = cand_idx[j];
+            picked_val = cand_val[j];
             break;
         }
     }
-    out[row] = picked;
-    if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+    // A support whose weights are all zero (an empty admissible set) leaves the draw meaningless;
+    // the candidate's own value, not just its index, is what decides the round.
+    const bool finite = sampling_value_is_finite(picked_val) &&
+                        sampling_selected_logit_is_finite(logits, base, picked);
+    out[row] = finite ? picked : kSamplerNonFiniteToken;
+    if (finite && cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
 }
 
 __launch_bounds__(kSamplerBlock) __global__
@@ -112,13 +122,16 @@ __launch_bounds__(kSamplerBlock) __global__
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
-            if (!sampling_token_admissible(cfg, v)) {
-                keys[item] = 0ull;
-                continue;
-            }
             const float raw = __bfloat162float(logits[base + v]);
-            const float x   = greedy ? raw : sampling_adjusted_logit(raw, v, cfg);
-            keys[item]      = sampling_sort_key(x, v);
+            // Constrained decoding: an inadmissible token is pushed to -INF but KEEPS its own id,
+            // so it ranks below every admissible candidate instead of taking the workspace's zero
+            // key. That key is the empty-slot sentinel: putting it in the candidate list both
+            // hides the token id (sampling_key_index(0) == INT_MAX) and, through
+            // sampling_key_float(0) being NaN, poisons the truncated distribution's weights.
+            // Greedy rows keep their documented penalty-free contract; only the mask applies.
+            const float x = greedy ? (sampling_token_admissible(cfg, v) ? raw : -CUDART_INF_F)
+                                   : sampling_adjusted_logit(raw, v, cfg);
+            keys[item]    = sampling_sort_key(x, v);
         } else {
             keys[item] = 0ull;
         }
@@ -199,7 +212,12 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
         }
         best = sampling_block_max_key(best, greedy_warp_keys);
         if (tid == 0) {
-            out[col]                  = sampling_key_index(best);
+            const int picked = sampling_key_index(best);
+            // This kernel never sees the logits, so the winner's own ordered value carries the
+            // check. An empty key (0ull) decodes to NaN, which is the same rejection.
+            out[col] = (picked == INT_MAX || !sampling_value_is_finite(sampling_key_float(best)))
+                           ? kSamplerNonFiniteToken
+                           : picked;
             workspace.group_done[col] = 0;
         }
         return;
@@ -270,15 +288,22 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
         const float u     = sampling_uniform(cfg.seed, logical_positions[col], purpose, 0u);
         float acc         = 0.0f;
         int picked        = cand_idx[support - 1];
+        float picked_val  = cand_val[support - 1];
         for (int j = 0; j < support; ++j) {
             acc += prob[j];
             if (u < acc) {
-                picked = cand_idx[j];
+                picked     = cand_idx[j];
+                picked_val = cand_val[j];
                 break;
             }
         }
-        out[col] = picked;
-        if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+        // The candidate's own adjusted value stands in for the logit: this kernel is fed by the
+        // partial/group workspace and never receives the logits themselves. A support that is
+        // entirely inadmissible leaves the draw meaningless, so the round fails instead of
+        // licensing whatever index the sentinel happened to carry.
+        const bool finite = sampling_value_is_finite(picked_val);
+        out[col]          = finite ? picked : kSamplerNonFiniteToken;
+        if (finite && cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
         workspace.group_done[col] = 0;
     }
 }

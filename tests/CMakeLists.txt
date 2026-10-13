@@ -315,6 +315,12 @@ ninfer_add_op_test(ninfer_structured_round_test
   SOURCES ops/test_structured_round.cpp
   LIBRARIES ninfer_ops ninfer_text ${NINFER_CUDART_TARGET})
 
+# Constrained decoding's multi-block support contract: a non-empty admissible set never returns a
+# token outside it. The mask producer is not involved; this pins the sampler's own seam.
+ninfer_add_op_test(ninfer_sampling_mask_support_test
+  SOURCES ops/test_sampling_mask_support.cpp
+  LIBRARIES ninfer_ops)
+
 # RoPE's YaRN frequency-override mode. Listed separately from the loop above because it also
 # consumes the family-owned host YaRN math (yarn_scale/yarn_rope_mscale, built into
 # ninfer_engine) as the source of both the native and the corrected frequency table, instead of

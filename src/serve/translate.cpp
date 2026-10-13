@@ -104,11 +104,27 @@ std::vector<std::string> effective_tool_jsons(const GenerationRequest& request) 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
                                                  const ServeOptions& server,
                                                  const ninfer::PromptCapabilities& capabilities) {
+    const bool constrained = request.structured_output.kind != StructuredOutputKind::None;
+    if (constrained && !request.stop_strings.empty()) {
+        // A constrained span ends at the grammar's own terminal, so a caller stop string would
+        // truncate a value the schema says must be complete. Reject the combination instead of
+        // publishing JSON that the client then fails to parse.
+        invalid_prompt_option("structured output requires default stops", "response_format",
+                              "incompatible_structured_output");
+    }
     ResolvedPromptSemantics result{
         .enable_thinking   = request.enable_thinking.value_or(server.enable_thinking),
         .reasoning_effort  = std::nullopt,
         .preserve_thinking = request.preserve_thinking.value_or(server.preserve_thinking),
     };
+    // Constrained decoding keeps the economical final-only default: a request that asks for a
+    // schema but does not itself select a reasoning mode runs without a reasoning block, so the
+    // schema's own tokens are the whole answer. An explicit enable_thinking / reasoning_effort
+    // always wins, and the reasoning envelope then carries the close marker before the value.
+    if (constrained && !request.enable_thinking.has_value() &&
+        !request.reasoning_effort.has_value()) {
+        result.enable_thinking = false;
+    }
     if (!request.reasoning_effort) { return result; }
 
     const RequestedReasoningEffort requested = *request.reasoning_effort;

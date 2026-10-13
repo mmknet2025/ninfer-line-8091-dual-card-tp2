@@ -43,6 +43,51 @@ __device__ inline T* speculative_workspace_offset(T* ptr, std::size_t byte_offse
                : reinterpret_cast<T*>(reinterpret_cast<unsigned char*>(ptr) + byte_offset);
 }
 
+// Width bound for the per-column selections a verify round commits. Sized for the widest
+// speculative window this file serves (DFlash's fifteen drafts plus one verify column).
+inline constexpr int kSpeculativeMaximumWidth = 16;
+
+// True when the verify forward's own per-column argmax cannot stand in for the greedy token. That
+// argmax is taken over the whole vocabulary, so under a constrained-decoding mask it can name a
+// token the grammar forbids; the round must then take the argmax over the column's admissible
+// tokens itself. Penalties alone do not move the argmax's identity for the commit, so only the
+// mask forces the recomputation -- which is what keeps every unmasked round bit-identical.
+__device__ __forceinline__ bool verify_argmax_needed(const SamplingConfig& cfg) {
+    return cfg.token_mask != nullptr;
+}
+
+// Block-cooperative argmax of one verify column over the column's admissible tokens. `overlay`
+// carries drafts[0..column) for the round-local penalty overlay and `column` is also the mask
+// column the grammar mask plane conditions on. All threads of the block must call; the selected
+// token is INT_MAX only when the column admits nothing at all (the mask producer prevents it).
+__device__ __forceinline__ std::int32_t
+verify_column_argmax(const __nv_bfloat16* row_logits, std::int64_t base, std::int32_t token_domain,
+                     const SamplingConfig& cfg, const std::int32_t* overlay, int column, int tid,
+                     int block_threads, float* scratch_val, int* scratch_idx) {
+    float best     = -CUDART_INF_F;
+    int best_index = INT_MAX;
+    for (int v = tid; v < token_domain; v += block_threads) {
+        const float value = sampling_adjusted_logit(__bfloat162float(row_logits[base + v]), v, cfg,
+                                                    overlay, column, column);
+        if (sampling_better(value, v, best, best_index)) {
+            best       = value;
+            best_index = v;
+        }
+    }
+    scratch_val[tid] = best;
+    scratch_idx[tid] = best_index;
+    __syncthreads();
+    for (int stride = block_threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && sampling_better(scratch_val[tid + stride], scratch_idx[tid + stride],
+                                            scratch_val[tid], scratch_idx[tid])) {
+            scratch_val[tid] = scratch_val[tid + stride];
+            scratch_idx[tid] = scratch_idx[tid + stride];
+        }
+        __syncthreads();
+    }
+    return scratch_idx[0];
+}
+
 __device__ inline SamplingWorkspace
 speculative_workspace_row(SamplingWorkspace workspace, std::size_t row_stride, std::int32_t row) {
     const std::size_t offset = static_cast<std::size_t>(row) * row_stride;
@@ -88,20 +133,53 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
         logits + static_cast<std::int64_t>(row) * cols * physical_rows;
 
     if (!(cfg.temperature > 0.0f)) {
+        // Greedy commit. Without a constrained-decoding mask the verify forward's own per-column
+        // argmax (`row_targets`) is the greedy token, and the original accept loop stands. With a
+        // mask it is not: that argmax was taken over the whole vocabulary, so the token it names
+        // can be one the grammar forbids -- committing it either publishes an illegal token or
+        // fails the request at the grammar's own acceptance check. The block therefore takes the
+        // argmax over each column's ADMISSIBLE tokens itself, which is exactly the token the
+        // ordinary sampler's greedy route licenses.
+        if (!verify_argmax_needed(cfg)) {
+            if (tid == 0) {
+                int a = 0;
+                while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
+                const int t_star = row_targets[a];
+
+                for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
+                for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
+                row_tokens[a] = t_star;
+
+                const int produced   = a + 1;
+                licensed_counts[row] = produced;
+                accepted[row]        = a;
+                anchors[row]         = t_star;
+                lengths[row] += produced;
+            }
+            return;
+        }
+        __shared__ float masked_val[kSamplerBlock];
+        __shared__ int masked_idx[kSamplerBlock];
+        __shared__ std::int32_t masked_tokens[kSpeculativeMaximumWidth];
+        for (int i = 0; i <= extent; ++i) {
+            const std::int64_t base = static_cast<std::int64_t>(i) * physical_rows;
+            const std::int32_t selected =
+                verify_column_argmax(row_logits, base, token_domain, cfg, row_drafts, i, tid,
+                                     blockDim.x, masked_val, masked_idx);
+            if (tid == 0) { masked_tokens[i] = selected; }
+            __syncthreads();
+        }
         if (tid == 0) {
             int a = 0;
-            while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
-            const int t_star = row_targets[a];
-
+            while (a < extent && masked_tokens[a] == row_drafts[a]) { ++a; }
+            const int t_star = masked_tokens[a];
             for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
             for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
-            row_tokens[a] = t_star;
-
-            const int produced   = a + 1;
-            licensed_counts[row] = produced;
+            row_tokens[a]        = t_star;
+            licensed_counts[row] = a + 1;
             accepted[row]        = a;
             anchors[row]         = t_star;
-            lengths[row] += produced;
+            lengths[row] += a + 1;
         }
         return;
     }
@@ -250,12 +328,12 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
 }
 
 __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group_finalize_kernel(
-    const std::int32_t* target_tokens, const std::int32_t* drafts,
+    const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t cols,
-    std::int32_t partial_blocks, std::int32_t group_count, SamplingWorkspace workspace,
-    std::size_t workspace_row_stride) {
+    std::int32_t partial_blocks, std::int32_t group_count, std::int32_t physical_rows,
+    SamplingWorkspace workspace, std::size_t workspace_row_stride) {
     const int row   = static_cast<int>(blockIdx.z);
     const int group = static_cast<int>(blockIdx.x);
     const int col   = static_cast<int>(blockIdx.y);
@@ -271,10 +349,36 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     if (token_domain <= kSamplerTileItems) { return; }
 
     if (!(cfg.temperature > 0.0f)) {
-        if (tid == 0 && col == 0 && group == 0) {
+        // The group blocks that do not own the commit still return immediately, exactly as before.
+        if (col != 0 || group != 0) { return; }
+        const __nv_bfloat16* row_logits =
+            logits + static_cast<std::int64_t>(row) * cols * physical_rows;
+        // Masked greedy: the verify forward's per-column argmax was taken over the whole
+        // vocabulary, so it can name a token this column's grammar mask forbids -- committing it
+        // publishes an illegal token or fails the request at the grammar's own acceptance check.
+        // This block takes the argmax over each column's ADMISSIBLE tokens instead, which is the
+        // token the ordinary sampler's greedy route licenses. `row_targets` stays authoritative
+        // when there is no mask, so every unconstrained round is unchanged.
+        __shared__ float masked_val[kSamplerGroupBlock];
+        __shared__ int masked_idx[kSamplerGroupBlock];
+        __shared__ std::int32_t masked_tokens[kSpeculativeMaximumWidth];
+        if (verify_argmax_needed(cfg)) {
+            for (int i = 0; i <= extent; ++i) {
+                const std::int64_t base = static_cast<std::int64_t>(i) * physical_rows;
+                const std::int32_t selected =
+                    verify_column_argmax(row_logits, base, token_domain, cfg, row_drafts, i, tid,
+                                         blockDim.x, masked_val, masked_idx);
+                if (tid == 0) { masked_tokens[i] = selected; }
+                __syncthreads();
+            }
+        }
+        if (tid == 0) {
+            const auto target_at = [&](int column) {
+                return verify_argmax_needed(cfg) ? masked_tokens[column] : row_targets[column];
+            };
             int a = 0;
-            while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
-            const int t_star = row_targets[a];
+            while (a < extent && target_at(a) == row_drafts[a]) { ++a; }
+            const int t_star = target_at(a);
             for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
             for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
             row_tokens[a]        = t_star;

@@ -489,57 +489,93 @@ std::string sse_event(const Json& payload) { return "data: " + payload.dump() + 
 
 } // namespace
 
-std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
+// One template option resolved from its top-level field and its `chat_template_kwargs` mirror.
+// Clients put these on either axis: the OpenAI-compatible top level (`enable_thinking`), or
+// inside `chat_template_kwargs` beside the Qwen template's own knobs. A disagreement is a request
+// error rather than a silent precedence rule.
+std::optional<bool> merge_boolean_option(const Json& body, const char* key) {
     std::optional<bool> top_level;
-    if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
-        if (!body.at("preserve_thinking").is_boolean()) {
-            bad_request("preserve_thinking must be a boolean or null", "preserve_thinking");
+    if (body.contains(key) && !body.at(key).is_null()) {
+        if (!body.at(key).is_boolean()) {
+            bad_request(std::string(key) + " must be a boolean or null", key);
         }
-        top_level = body.at("preserve_thinking").get<bool>();
+        top_level = body.at(key).get<bool>();
     }
-
     std::optional<bool> template_value;
+    if (body.contains("chat_template_kwargs")) {
+        const Json& kwargs = body.at("chat_template_kwargs");
+        if (kwargs.contains(key) && !kwargs.at(key).is_null()) {
+            if (!kwargs.at(key).is_boolean()) {
+                bad_request(std::string("chat_template_kwargs.") + key + " must be a boolean or null",
+                            "chat_template_kwargs");
+            }
+            template_value = kwargs.at(key).get<bool>();
+        }
+    }
+    if (top_level && template_value && *top_level != *template_value) {
+        bad_request(std::string("conflicting ") + key + " values", key, "conflicting_template_option");
+    }
+    return template_value ? template_value : top_level;
+}
+
+std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
+    // The kwargs object is validated once, here: every option this endpoint accepts from the
+    // Qwen template's own surface is listed, and anything else is a request error rather than a
+    // silently ignored knob.
     if (body.contains("chat_template_kwargs")) {
         const Json& kwargs = body.at("chat_template_kwargs");
         if (!kwargs.is_object()) {
             bad_request("chat_template_kwargs must be an object", "chat_template_kwargs");
         }
         for (auto it = kwargs.begin(); it != kwargs.end(); ++it) {
-            if (it.key() != "preserve_thinking" && !it.value().is_null()) {
-                bad_request("chat_template_kwargs." + it.key() + " is not supported",
+            const std::string key = it.key();
+            if (key != "preserve_thinking" && key != "enable_thinking" &&
+                key != "reasoning_effort" && !it.value().is_null()) {
+                bad_request("chat_template_kwargs." + key + " is not supported",
                             "chat_template_kwargs", "chat_template_option_not_supported");
             }
         }
-        if (kwargs.contains("preserve_thinking") && !kwargs.at("preserve_thinking").is_null()) {
-            if (!kwargs.at("preserve_thinking").is_boolean()) {
-                bad_request("chat_template_kwargs.preserve_thinking must be a boolean or null",
-                            "chat_template_kwargs");
-            }
-            template_value = kwargs.at("preserve_thinking").get<bool>();
-        }
     }
+    return merge_boolean_option(body, "preserve_thinking");
+}
 
-    if (top_level && template_value && *top_level != *template_value) {
-        bad_request("conflicting preserve_thinking values", "preserve_thinking",
-                    "conflicting_template_option");
+std::optional<RequestedReasoningEffort> parse_reasoning_effort_value(const Json& value,
+                                                                    const std::string& param) {
+    if (!value.is_string()) { bad_request(param + " must be a string or null", param); }
+    const std::optional<RequestedReasoningEffort> effort =
+        parse_requested_reasoning_effort(value.get<std::string>());
+    if (!effort) {
+        bad_request(param +
+                        " must be one of none, minimal, low, medium, high, xhigh, or max",
+                    param);
     }
-    return template_value ? template_value : top_level;
+    return effort;
 }
 
 void parse_openai_reasoning_effort(const Json& body, GenerationRequest& out) {
-    if (!body.contains("reasoning_effort") || body.at("reasoning_effort").is_null()) { return; }
-    if (!body.at("reasoning_effort").is_string()) {
-        bad_request("reasoning_effort must be a string or null", "reasoning_effort");
+    std::optional<RequestedReasoningEffort> top_level;
+    if (body.contains("reasoning_effort") && !body.at("reasoning_effort").is_null()) {
+        top_level = parse_reasoning_effort_value(body.at("reasoning_effort"), "reasoning_effort");
     }
-    const std::string value = body.at("reasoning_effort").get<std::string>();
-    const std::optional<RequestedReasoningEffort> effort = parse_requested_reasoning_effort(value);
-    if (!effort) {
-        bad_request("reasoning_effort must be one of none, minimal, low, medium, high, xhigh, or "
-                    "max",
-                    "reasoning_effort");
+    std::optional<RequestedReasoningEffort> template_value;
+    if (body.contains("chat_template_kwargs")) {
+        const Json& kwargs = body.at("chat_template_kwargs");
+        if (kwargs.contains("reasoning_effort") && !kwargs.at("reasoning_effort").is_null()) {
+            template_value = parse_reasoning_effort_value(
+                kwargs.at("reasoning_effort"), "chat_template_kwargs.reasoning_effort");
+        }
     }
-    out.reasoning_effort       = *effort;
-    out.reasoning_effort_param = "reasoning_effort";
+    if (top_level && template_value && *top_level != *template_value) {
+        bad_request("conflicting reasoning_effort values", "reasoning_effort",
+                    "conflicting_template_option");
+    }
+    if (template_value) {
+        out.reasoning_effort       = *template_value;
+        out.reasoning_effort_param = "chat_template_kwargs.reasoning_effort";
+    } else if (top_level) {
+        out.reasoning_effort       = *top_level;
+        out.reasoning_effort_param = "reasoning_effort";
+    }
 }
 
 GenerationRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
@@ -564,9 +600,7 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     if (body.contains("stream_options") && body.at("stream_options").is_object()) {
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
     }
-    if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
-        out.enable_thinking = get_bool(body, "enable_thinking", false);
-    }
+    out.enable_thinking = merge_boolean_option(body, "enable_thinking");
     parse_openai_reasoning_effort(body, out);
     out.preserve_thinking = parse_openai_preserve_thinking(body);
 
