@@ -1,9 +1,11 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "text/structured_output.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <stdexcept>
 
@@ -24,6 +26,12 @@ struct ResolvedExecutionOptions {
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    // The wire-level constraint this request carried, if any. `grammar` is the compiled form: it
+    // is built once, here, by the engine (the only layer that owns the tokenizer) and then travels
+    // with the request plan into the target's per-lane control block, where the decode path
+    // advances it and the sampler reads its masks. Never shared between requests.
+    StructuredOutputOptions structured_output;
+    std::shared_ptr<text::GrammarState> grammar;
 };
 
 struct ResolvedRequestOptions {

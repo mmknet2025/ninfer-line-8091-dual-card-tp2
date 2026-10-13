@@ -94,6 +94,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
 
     auto base                             = std::make_unique<RequestBasePlanImpl>();
     base->summary.prompt_tokens           = static_cast<std::uint32_t>(prompt.token_ids.size());
+    base->grammar                         = options.grammar;
     base->summary.requested_output_tokens = options.requested_output_tokens;
     const std::uint32_t capacity_output =
         capacity - base->summary.prompt_tokens + static_cast<std::uint32_t>(1);
@@ -188,6 +189,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     auto plan                         = std::make_unique<RequestPlanImpl>();
     plan->summary                     = base.summary;
     plan->sampling                    = base.sampling;
+    plan->grammar                     = base.grammar;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
 

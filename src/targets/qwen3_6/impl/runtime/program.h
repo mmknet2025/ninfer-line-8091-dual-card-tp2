@@ -14,6 +14,7 @@
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
+#include "targets/qwen3_6/impl/runtime/structured_round.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -64,6 +65,9 @@ template <>
 struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     runtime::RequestPlanSummary summary;
     ops::SamplingConfig sampling;
+    // The request's compiled constraint, if any. Compiled once by the engine (the only layer that
+    // owns the tokenizer) and carried, never shared, into the lane's RequestControl.
+    std::shared_ptr<text::GrammarState> grammar;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_6::VisionControl> vision_control;
@@ -85,6 +89,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
         NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction::Drop;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint_capture;
     ops::SamplingConfig sampling;
+    std::shared_ptr<text::GrammarState> grammar;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
 };
@@ -187,6 +192,10 @@ struct RequestControl {
     Lifecycle lifecycle = Lifecycle::Empty;
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
+    // This request's compiled constraint. Owned here for the request's lifetime: the decode path
+    // refreshes the mask plane from it every round and `accept()`s the tokens a resolved round
+    // commits. A retained lane keeps no grammar.
+    std::shared_ptr<text::GrammarState> grammar;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
 
@@ -343,6 +352,9 @@ public:
     std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;
+    // Mask-plane producer. Non-null exactly when the engine was started with `--structured-output`
+    // (the plan allocated the plane); null means every decode path takes its historical shape.
+    std::unique_ptr<::ninfer::targets::qwen3_6::detail::StructuredRound> structured_round;
     Tensor prefill_hidden;
     Tensor sampling_config;
     Tensor token_counts;

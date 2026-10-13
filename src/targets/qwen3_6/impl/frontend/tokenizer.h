@@ -51,6 +51,10 @@ public:
     [[nodiscard]] bool is_valid_token(int id) const noexcept;
     [[nodiscard]] bool has_exact_token_domain(std::size_t size) const noexcept;
 
+    // The checkpoint's own vocabulary extent. The structured-output frontend walks it to build the
+    // decoded-token table a grammar compiler is constructed from.
+    [[nodiscard]] std::size_t vocab_size() const noexcept { return id_to_token_.size(); }
+
 private:
     std::vector<std::string> id_to_token_;
     std::vector<bool> valid_token_ids_;

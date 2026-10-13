@@ -10,6 +10,12 @@
 #include <span>
 #include <vector>
 
+namespace ninfer {
+namespace text {
+class GrammarState;
+} // namespace text
+} // namespace ninfer
+
 namespace ninfer::targets::qwen3_6 {
 
 inline constexpr std::size_t kTokenDomain = 248077;
@@ -130,6 +136,13 @@ public:
     [[nodiscard]] OutputSession make_output_session(const PreparedPrompt& prompt,
                                                     const StopPolicy& caller_stop,
                                                     const OutputOptions& output = {}) const;
+    // Compile a request's structured-output constraint into a fresh, request-owned grammar state.
+    // Returns null for an unconstrained request. The grammar compiler itself is built once from the
+    // checkpoint vocabulary and cached; only the state is per request. Throws on a constraint the
+    // pinned grammar compiler refuses, before any lane is touched.
+    [[nodiscard]] std::shared_ptr<text::GrammarState>
+    compile_structured_output(const PreparedPrompt& prompt,
+                              const StructuredOutputOptions& structured) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
 
 private:

@@ -236,6 +236,17 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.sampling_config = add_tensor(
         builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
         "sampling config");
+    // The mask plane exists only when the engine asked for structured output. `token_domain` is
+    // the public vocabulary, and `draft_window + 1` covers the widest verify window any backend in
+    // this family can execute (the ordinary path's window is one column wide).
+    if (plan.structured_output) {
+        out.grammar_masks = add_tensor(
+            builder, DType::I32,
+            {static_cast<std::int32_t>((TextConfig::token_domain + 31U) / 32U),
+             static_cast<std::int32_t>(plan.draft_window + 1U),
+             static_cast<std::int32_t>(plan.max_concurrency)},
+            "structured output token masks");
+    }
     out.tail_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
         "tail hidden");
@@ -732,6 +743,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
+    impl->structured_output   = inputs.structured_output;
     impl->rope_mode           = inputs.rope_mode;
     impl->yarn_factor         = inputs.yarn_factor;
     impl->yarn_origin         = inputs.yarn_origin;
@@ -924,6 +936,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .kv_v_quant_group = kv_cache_v_quant_group(options.kv_cache),
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_6::startup_features(options),
+        .structured_output = options.structured_output,
         .rope_mode      = options.rope_mode,
         .yarn_factor    = options.yarn_factor,
         .yarn_origin    = options.yarn_origin,

@@ -24,6 +24,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
+    resolved.execution.structured_output       = std::move(options.execution.structured_output);
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
     return resolved;

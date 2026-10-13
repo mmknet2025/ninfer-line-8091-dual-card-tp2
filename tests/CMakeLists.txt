@@ -311,6 +311,10 @@ foreach(op IN LISTS ninfer_op_tests)
     LIBRARIES ninfer_ops)
 endforeach()
 
+ninfer_add_op_test(ninfer_structured_round_test
+  SOURCES ops/test_structured_round.cpp
+  LIBRARIES ninfer_ops ninfer_text ${NINFER_CUDART_TARGET})
+
 # RoPE's YaRN frequency-override mode. Listed separately from the loop above because it also
 # consumes the family-owned host YaRN math (yarn_scale/yarn_rope_mscale, built into
 # ninfer_engine) as the source of both the native and the corrected frequency table, instead of

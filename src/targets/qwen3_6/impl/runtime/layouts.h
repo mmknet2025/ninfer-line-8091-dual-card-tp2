@@ -42,6 +42,11 @@ struct PersistentLayout {
     TensorLayout prefill_hidden;
     TensorLayout token_counts;
     TensorLayout sampling_config;
+    // Constrained-decoding mask planes, present only when the engine was started with
+    // `--structured-output`. Shape [ceil(vocab/32) words, widest_verify_window + 1, max_concurrency]:
+    // one lane-major plane per request slot, `token_mask_stride` words per verify column. Absent,
+    // the persistent layout is byte-identical to the pre-structured-output plan.
+    std::optional<TensorLayout> grammar_masks;
     TensorLayout tail_hidden;
     TensorLayout rewrite_checkpoint_hidden;
     std::size_t bytes            = 0;
@@ -75,6 +80,9 @@ struct SequencePlanningInputs {
     std::int32_t kv_v_quant_group          = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
+    // Reserves the grammar mask planes. Off (the default), no plan byte changes and every request
+    // path stays exactly as it was; on, only the mask planes are added.
+    bool structured_output                 = false;
     // Rotary regime. Nothing in the persistent or workspace layout depends on these:
     // the YaRN table is a 32-float per-device buffer the Program owns outside the planned arenas,
     // so a native plan is byte-identical to the pre-YaRN one. They are carried here only so the
@@ -119,6 +127,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::int32_t kv_quant_group            = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
+    bool structured_output                 = false;
     // See SequencePlanningInputs: rope regime carried through the plan, layout-neutral.
     RopeMode rope_mode                  = RopeMode::Native;
     double yarn_factor                  = 0.0;

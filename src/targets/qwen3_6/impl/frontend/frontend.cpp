@@ -8,6 +8,7 @@
 #include "targets/qwen3_6/impl/frontend/processor.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
+#include "text/structured_output.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -20,6 +21,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -670,6 +672,12 @@ public:
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
     bool vision_enabled = true;
+    // Structured-output frontend. The compiler is built from the checkpoint vocabulary exactly
+    // once and shared by every constrained request; a grammar STATE is compiled per request, so
+    // concurrent constrained requests never share state. Both members are touched only under
+    // `grammar_mutex`, and neither exists in the plan of an engine started without the switch.
+    mutable std::mutex grammar_mutex;
+    mutable std::unique_ptr<text::StructuredCompiler> grammar_compiler;
 };
 
 class OutputSession::Impl {
@@ -1053,5 +1061,34 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }
+
+std::shared_ptr<text::GrammarState>
+Frontend::compile_structured_output(const PreparedPrompt& prompt,
+                                    const StructuredOutputOptions& structured) const {
+    if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
+    text::validate_structured_output(structured);
+    if (structured.kind == StructuredOutputKind::None) { return nullptr; }
+    // The model's own framing around the constrained span. This target has no tool-call
+    // serialization contract yet, so the only envelope term that exists is the reasoning close
+    // when the prompt ends inside a reasoning block.
+    text::StructuredOutputEnvelope envelope;
+    if (prompt.data_->starts_in_reasoning) { envelope.reasoning_close = std::string(kThinkClose); }
+    std::lock_guard lock(impl_->grammar_mutex);
+    if (!impl_->grammar_compiler) {
+        const fi::Tokenizer& tokenizer = *impl_->tokenizer;
+        std::vector<std::string> vocab(tokenizer.vocab_size());
+        for (std::size_t id = 0; id < vocab.size(); ++id) {
+            const auto token = static_cast<int>(id);
+            if (!tokenizer.is_valid_token(token)) { continue; }
+            const std::string piece = tokenizer.decode_token_bytes(token, false);
+            // Unconstrained-capable tokens are the non-special vocabulary plus the reasoning close
+            // marker, which must remain sampleable so a constrained block can be entered.
+            if (!tokenizer.is_special_token(token) || piece == kThinkClose) { vocab[id] = piece; }
+        }
+        impl_->grammar_compiler = std::make_unique<text::StructuredCompiler>(
+            std::move(vocab), tokenizer.default_stop_token_ids());
+    }
+    return impl_->grammar_compiler->compile(structured, envelope);
+}
 
 } // namespace ninfer::targets::qwen3_6

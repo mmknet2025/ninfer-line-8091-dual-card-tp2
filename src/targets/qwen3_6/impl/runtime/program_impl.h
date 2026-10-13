@@ -387,6 +387,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     prefill_hidden                  = plan.persistent.prefill_hidden.bind(backing);
     token_counts                    = plan.persistent.token_counts.bind(backing);
     sampling_config                 = plan.persistent.sampling_config.bind(backing);
+    // The mask plane is planned only when the engine was started with `--structured-output`, so a
+    // default engine never allocates it and never enters any constrained path.
+    if (plan.persistent.grammar_masks) {
+        structured_round = std::make_unique<::ninfer::targets::qwen3_6::detail::StructuredRound>(
+            plan.persistent.grammar_masks->bind(backing),
+            static_cast<std::uint32_t>(TextConfig::token_domain), plan.draft_window + 1U,
+            max_concurrency, device.stream);
+    }
     tail_hidden_store               = plan.persistent.tail_hidden.bind(backing);
     rewrite_checkpoint_hidden_store = plan.persistent.rewrite_checkpoint_hidden.bind(backing);
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
@@ -756,6 +764,12 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                 : 0U;
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
+        // The compiled constraint belongs to the request, not to the retained lane it may land on.
+        if (request_plan.grammar && !structured_round) {
+            throw std::logic_error(
+                "constrained request reached a Program with no planned grammar mask plane");
+        }
+        request.grammar = request_plan.grammar;
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
@@ -1025,6 +1039,12 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                     : dflash_host_egress->licensed_tokens.data() + row * width;
             sequence.ledger.insert(sequence.ledger.end(), token_base, token_base + committed);
             sequence.prefix_identity.append_generated(committed, sequence.rope_delta);
+            // Commit the grammar with the round. Only the licensed prefix advances it: rejected
+            // drafts were never in the constrained language and must not be replayed into it.
+            if (request.grammar) {
+                request.grammar->accept(
+                    std::span<const TokenId>(token_base, static_cast<std::size_t>(committed)));
+            }
             sequence.execution_frontier = pending.base_E + committed;
             sequence.ledger_frontier    = pending.base_S + committed;
             sequence.text_kv_valid      = sequence.execution_frontier;
@@ -1091,6 +1111,7 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
+    request.grammar.reset();
     sequence.kv.reset();
     request.lifecycle           = Lifecycle::Empty;
     sequence.execution_frontier = 0;
@@ -2019,6 +2040,15 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
         CUDA_CHECK(cudaMemsetAsync(peer_counts.data, 0, peer_counts.bytes(), peer->device.stream));
     }
     request.sampling_host     = config;
+    // Constrained request: the per-row SamplingConfig the sampler reads must carry this lane's
+    // plane base and stride. The pointer is a Program-persistent address, so the captured ingress
+    // record keeps naming valid storage across replays; only the plane's CONTENTS are refreshed
+    // here (column zero, i.e. the state after every committed token) and again each round.
+    if (request.grammar) {
+        request.sampling_host.token_mask        = structured_round->device_mask(sequence.lane);
+        request.sampling_host.token_mask_stride = structured_round->stride();
+        structured_round->fill(sequence.lane, *request.grammar, {}, device.stream);
+    }
     request.speculative_stats = SpeculativeStats{
         .backend               = speculative_backend,
         .enabled               = speculative_backend != SpeculativeBackend::None,
@@ -2427,6 +2457,11 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
             ordinary_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
             ordinary_host_ingress->sampling[row] = request.sampling_host;
+            if (request.grammar) {
+                // Column zero only: the ordinary round verifies no drafts, so the grammar's current
+                // state is the whole mask this round samples through.
+                structured_round->fill(sequence.lane, *request.grammar, {}, device.stream);
+            }
             materialize_sequence_kv(sequence, frontier + 1, 0);
         }
         publish_peer_ordinary_ingress();
@@ -2441,6 +2476,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             *ordinary_host_egress,
             tail_hidden_store,
             ordinary_peer_host_ingress};
+        schedule_state.execution.structured = structured_round.get();
 
         mark_workspace_usage(workspace_plan.ordinary_round);
         schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -2562,6 +2598,16 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->lanes[row]              = static_cast<std::int32_t>(sequence.lane);
             mtp_host_ingress->rope_deltas[row]        = sequence.rope_delta;
             mtp_host_ingress->sampling[row]           = request.sampling_host;
+            if (request.grammar) {
+                // Column i is conditioned on draft i, so the mask plane must know this round's
+                // drafts: the same extent the verify leg executes.
+                structured_round->fill(
+                    sequence.lane, *request.grammar,
+                    std::span<const TokenId>(mtp_host_ingress->current_drafts.data() +
+                                                 static_cast<std::size_t>(row) * draft_window,
+                                             extent),
+                    device.stream);
+            }
             materialize_sequence_kv(sequence, frontier + extent + 1,
                                     std::min(capacity, frontier + extent + draft_window));
         }
@@ -2578,6 +2624,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,
                                                  tail_hidden_store};
+        schedule_state.execution.structured = structured_round.get();
 
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -2736,6 +2783,19 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             materialize_sequence_kv(sequence, frontier + extent + 1U, frontier);
         }
 
+        // DFlash proposes on device inside the very graph that verifies, so its masks cannot be
+        // precomputed here. Stage the rows and let the round's own host node fill the plane
+        // mid-flight (see StructuredRound::enqueue_dflash).
+        if (structured_round) {
+            structured_round->begin_dflash();
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                structured_round->set_dflash_row(
+                    static_cast<std::uint32_t>(row), lanes[row],
+                    static_cast<std::uint32_t>(dflash_host_ingress->proposal_extents[row]),
+                    requests[lanes[row]].grammar);
+            }
+        }
+
         schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
@@ -2746,11 +2806,14 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                     *dflash_host_ingress,
                                                     *dflash_host_egress,
                                                     tail_hidden_store};
+        schedule_state.execution.structured = structured_round.get();
 
         mark_workspace_usage(workspace_plan.dflash_round);
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                       draft_window, envelopes, target_envelope, executable);
         device.synchronize();
+        // The DFlash host node fills the plane mid-graph; anything it caught surfaces here.
+        if (structured_round) { structured_round->check(); }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -2853,6 +2916,15 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
         sequence.ledger.size() != sequence.ledger_frontier ||
         sequence.prefix_identity.size() != sequence.ledger_frontier) {
         throw std::logic_error("resolved round did not establish a valid frontier");
+    }
+    // The round is committed: advance the request's grammar past exactly the tokens that were
+    // committed. The next round's mask plane is filled from this state, so a constrained request
+    // can never sample a token its own grammar would not have produced. A cancelled or aborted
+    // round never reaches here; clear_lane drops the grammar instead.
+    if (request.grammar) {
+        const auto committed = sequence.ledger_frontier - accepted_tokens;
+        request.grammar->accept(
+            std::span<const TokenId>(sequence.ledger).subspan(committed, accepted_tokens));
     }
     trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
     if (terminal) {

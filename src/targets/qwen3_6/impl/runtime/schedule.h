@@ -14,6 +14,7 @@
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
+#include "targets/qwen3_6/impl/runtime/structured_round.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
@@ -98,6 +99,11 @@ struct ExecutionCore {
     // bit-for-bit, which is why the default value is the pre-YaRN behavior.
     std::array<ops::RopeFrequencyOverride, 2> rope_frequency{};
     const TpPeerCore* peer = nullptr;
+    // Mask-plane producer, set by the Program on every round it schedules. Null (the default, and
+    // every engine started without `--structured-output`) leaves the round structurally unchanged.
+    // Present here rather than on the round state because the DFlash body is the one schedule
+    // entry point that has to stage its masks mid-graph.
+    StructuredRound* structured = nullptr;
 };
 
 // Assembles the TextContext-side view of `peer`. Returns an empty optional at tp == 1.

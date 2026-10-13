@@ -157,6 +157,14 @@ public:
         try {
             auto output = instance_.loaded->frontend.make_output_session(prompt, options.stop,
                                                                          options.output);
+            // Compile the request's constraint before any lane is touched. The engine is the only
+            // layer that owns the checkpoint tokenizer, so the grammar is built here, once, and
+            // rides the request plan into the target's per-lane control block. An unconstrained
+            // request leaves this null and every later path is the historical one.
+            if (options.execution.structured_output.kind != StructuredOutputKind::None) {
+                options.execution.grammar = instance_.loaded->frontend.compile_structured_output(
+                    prompt, options.execution.structured_output);
+            }
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
                                                 pending_deadline, submitted);

@@ -353,6 +353,13 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                      lanes, dflash_rows, envelopes.append);
 
         propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
+
+        // The proposal drafts are on device now: stage the verify masks around the two remaining
+        // enqueues so the captured verify reads a plane whose columns match this round's drafts.
+        if (state.execution.structured) {
+            state.execution.structured->enqueue_dflash(drafts, state.execution.device.stream);
+        }
+
         ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids,
                                             state.execution.device.stream);
 

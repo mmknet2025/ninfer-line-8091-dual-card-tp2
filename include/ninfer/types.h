@@ -128,6 +128,10 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
+    // Reserves the grammar mask planes that constrained requests sample through. Off, every
+    // request path is byte-identical to the pre-structured-output plan and a constrained request
+    // is refused at the wire layer instead of being admitted unconstrained.
+    bool structured_output                 = false;
     LoadProgress load_progress;
 };
 
