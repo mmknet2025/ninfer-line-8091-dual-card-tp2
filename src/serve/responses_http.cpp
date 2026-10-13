@@ -208,8 +208,10 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     ResponseContext previous_context;
     try {
         RequestLimits limits;
-        limits.default_max_tokens = options_.default_max_tokens;
-        request                   = parse_responses_request(parse_json_body(req), limits);
+        limits.default_max_tokens            = options_.default_max_tokens;
+        limits.structured_output             = options_.structured_output;
+        limits.unconstrained_response_format = options_.unconstrained_response_format;
+        request                              = parse_responses_request(parse_json_body(req), limits);
         validate_model(request.generation.model, public_model_id_);
         if (request.previous_response_id) {
             const std::shared_ptr<const StoredResponse> previous =

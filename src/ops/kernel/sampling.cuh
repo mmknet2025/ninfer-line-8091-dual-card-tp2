@@ -24,11 +24,13 @@ __launch_bounds__(kSamplerBlock) __global__
     __shared__ float red_val[kSamplerBlock];
     __shared__ int red_idx[kSamplerBlock];
 
-    // Greedy: exact argmax over raw logits. Bit-identical to argmax().
+    // Greedy: exact argmax over raw logits. Bit-identical to argmax(). With a constrained-decoding
+    // mask the argmax is taken over the admissible tokens only, so the mask is applied here too.
     if (!(cfg.temperature > 0.0f)) {
         float bv = -CUDART_INF_F;
         int bi   = INT_MAX;
         for (int v = tid; v < token_domain; v += blockDim.x) {
+            if (!sampling_token_admissible(cfg, v)) { continue; }
             const float x = __bfloat162float(logits[base + v]);
             if (sampling_better(x, v, bv, bi)) {
                 bv = x;
@@ -110,6 +112,10 @@ __launch_bounds__(kSamplerBlock) __global__
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
+            if (!sampling_token_admissible(cfg, v)) {
+                keys[item] = 0ull;
+                continue;
+            }
             const float raw = __bfloat162float(logits[base + v]);
             const float x   = greedy ? raw : sampling_adjusted_logit(raw, v, cfg);
             keys[item]      = sampling_sort_key(x, v);

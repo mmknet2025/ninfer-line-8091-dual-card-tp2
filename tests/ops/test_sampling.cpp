@@ -579,6 +579,117 @@ int workspace_route_boundary_contract() {
     return failures;
 }
 
+
+// Constrained decoding (opt-in): a sampling mask removes inadmissible tokens from the support
+// before penalties and every filter, and a null mask is bit-identical to the unconstrained path.
+int mask_contract() {
+    int failures = 0;
+    const auto allow = [](int words, std::initializer_list<int> tokens) {
+        std::vector<std::uint32_t> mask(static_cast<std::size_t>(words), 0U);
+        for (int t : tokens) { mask[static_cast<std::size_t>(t) / 32] |= (1U << (t % 32)); }
+        return mask;
+    };
+    const auto run = [&failures](int token_domain, const ops::SamplingConfig& base,
+                                 const std::vector<std::uint32_t>& mask,
+                                 const std::vector<float>& column, int position) {
+        const int batch = 1;
+        const int words = (token_domain + 31) / 32;
+        DeviceBuffer device_logits    = to_device_bf16(column);
+        ops::SamplingConfig config    = base;
+        std::unique_ptr<GuardedDeviceBuffer> device_mask;
+        if (!mask.empty()) {
+            device_mask = std::make_unique<GuardedDeviceBuffer>(
+                static_cast<std::size_t>(words) * sizeof(std::uint32_t));
+            device_mask->copy_from_host(mask.data(),
+                                        static_cast<std::size_t>(words) * sizeof(std::uint32_t));
+            config.token_mask        = static_cast<const std::uint32_t*>(device_mask->data());
+            config.token_mask_stride = words;
+        }
+        DeviceBuffer device_configs   = to_device(std::vector<ops::SamplingConfig>{config});
+        DeviceBuffer device_positions = to_device(std::vector<int>{position});
+        GuardedDeviceBuffer device_out(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+        Tensor logits_tensor(device_logits.p, DType::BF16, {token_domain, batch});
+        Tensor out_tensor(device_out.data(), DType::I32, {batch});
+        Tensor positions_tensor(device_positions.p, DType::I32, {batch});
+        const std::size_t workspace_bytes =
+            ops::sampling_workspace_capacity_bytes(token_domain, batch, batch);
+        WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+        ops::sample(logits_tensor, out_tensor, token_domain,
+                    static_cast<const ops::SamplingConfig*>(device_configs.p), positions_tensor,
+                    ops::kSamplePurposeDecode, workspace, nullptr);
+        cuda_synchronize();
+        failures += device_mask ? device_mask->verify_guards("sample mask") : 0;
+        return from_device<int>(device_out.data(), batch)[0];
+    };
+
+    // Single-block route (token_domain <= kSamplerTileItems): the greedy argmax and the truncated
+    // support builder both honour the mask.
+    {
+        constexpr int vocab = 200;
+        constexpr int words = (vocab + 31) / 32;
+        std::vector<float> column(vocab, -10.0f);
+        column[7] = 5.0f;
+        column[150] = 3.0f;
+        column[190] = 1.0f;
+        ops::SamplingConfig greedy; // temperature 0 => exact argmax
+        ops::SamplingConfig stochastic;
+        stochastic.temperature = 1.0f;
+        stochastic.seed        = 12345ULL;
+
+        failures += verify_exact("sample null mask keeps the raw argmax",
+                                 std::vector<int>{run(vocab, greedy, {}, column, 0)},
+                                 std::vector<int>{7});
+        failures += verify_exact(
+            "sample mask excludes the global argmax",
+            std::vector<int>{run(vocab, greedy, allow(words, {150, 190}), column, 0)},
+            std::vector<int>{150});
+        failures += verify_exact(
+            "sample mask narrows the greedy argmax to one token",
+            std::vector<int>{run(vocab, greedy, allow(words, {190}), column, 0)},
+            std::vector<int>{190});
+        failures += verify_exact(
+            "sample mask collapses a stochastic support",
+            std::vector<int>{run(vocab, stochastic, allow(words, {190}), column, 1)},
+            std::vector<int>{190});
+        bool only_admissible = true;
+        int seen_dominant    = 0;
+        for (int i = 0; i < 64; ++i) {
+            const int token = run(vocab, stochastic, allow(words, {150, 190}), column, 100 + i);
+            if (token != 150 && token != 190) { only_admissible = false; }
+            if (token == 150) { ++seen_dominant; }
+        }
+        if (!only_admissible) {
+            std::cerr << "sample masked stochastic draw left the admissible set\n";
+            ++failures;
+        }
+        if (seen_dominant == 0) {
+            std::cerr << "sample masked stochastic draw ignored the dominant admissible token\n";
+            ++failures;
+        }
+    }
+
+    // Multi-block route (token_domain > kSamplerTileItems): the partial/group kernels honour the
+    // mask in both the greedy and the truncated path.
+    {
+        constexpr int vocab = 512;
+        constexpr int words = (vocab + 31) / 32;
+        std::vector<float> column(vocab, -10.0f);
+        column[7] = 5.0f;
+        column[300] = 3.0f;
+        column[490] = 1.0f;
+        ops::SamplingConfig greedy;
+        failures += verify_exact(
+            "sample multiblock mask excludes the global argmax",
+            std::vector<int>{run(vocab, greedy, allow(words, {300, 490}), column, 0)},
+            std::vector<int>{300});
+        failures += verify_exact(
+            "sample multiblock mask narrows the greedy argmax to one token",
+            std::vector<int>{run(vocab, greedy, allow(words, {490}), column, 0)},
+            std::vector<int>{490});
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -608,6 +719,7 @@ int main() {
     failures += real_shape_distribution_contract();
     failures += rng_key_contract();
     failures += workspace_route_boundary_contract();
+    failures += mask_contract();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";
     return failures == 0 ? 0 : 1;

@@ -30,6 +30,15 @@ struct SamplingConfig {
     float frequency_penalty    = 0.0f;
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
+    // Optional constrained-decoding bitset, filled by the structured-output grammar frontend.
+    // Device [ceil(token_domain/32) * speculative_width] u32; column i is conditioned on
+    // drafts[0..i). A token v is admissible iff its bit is set. The mask is applied BEFORE
+    // penalties and every filter, so it composes with ordinary sampling. Null (the default) is
+    // the historical unconstrained path, bit-identical to a build without this field. Every row
+    // with a mask must have at least one admissible token with a finite logit. `ordinary sample
+    // uses column zero` (token_mask_stride words per column).
+    const std::uint32_t* token_mask = nullptr;
+    std::int32_t token_mask_stride  = 0;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive

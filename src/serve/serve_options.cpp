@@ -128,7 +128,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
-           "[--frequency-penalty F] [--seed N] [--greedy]\n"
+           "[--frequency-penalty F] [--seed N] [--greedy] "
+           "[--structured-output] [--unconstrained-response-format]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
@@ -157,6 +158,10 @@ std::string serve_usage_text(const char* argv0) {
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n"
+           "       --structured-output accepts JSON and JSON Schema response formats and\n"
+           "       constrains generation with the vendored XGrammar compiler (off by default).\n"
+           "       --unconstrained-response-format, without --structured-output, generates such\n"
+           "       a request unconstrained instead of refusing it.\n"
            "       --tp selects the tensor-parallel degree (default 1); --tp 2 splits the model "
            "across two GPUs and requires --devices; it supports --spec mtp but not --spec "
            "dflash, and not --vision.\n"
@@ -346,6 +351,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.sampling_overrides.seed = parse_u64(require_value("--seed"), "seed");
         } else if (arg == "--greedy") {
             options.greedy = true;
+        } else if (arg == "--structured-output") {
+            options.structured_output = true;
+        } else if (arg == "--unconstrained-response-format") {
+            options.unconstrained_response_format = true;
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }
@@ -388,6 +397,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
+    if (options.unconstrained_response_format && options.structured_output) {
+        throw std::invalid_argument(
+            "--unconstrained-response-format conflicts with --structured-output");
+    }
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
         throw std::invalid_argument("--spec dflash cannot be combined with --vision");
     }

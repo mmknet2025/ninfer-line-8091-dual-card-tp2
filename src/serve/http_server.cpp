@@ -354,8 +354,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     GenerationRequest request;
     try {
         RequestLimits limits;
-        limits.default_max_tokens = options_.default_max_tokens;
-        request                   = parse_chat_completion_request(body, limits);
+        limits.default_max_tokens            = options_.default_max_tokens;
+        limits.structured_output             = options_.structured_output;
+        limits.unconstrained_response_format = options_.unconstrained_response_format;
+        request                              = parse_chat_completion_request(body, limits);
         if (request.model != public_model_id_) {
             ApiError error;
             error.status  = 404;

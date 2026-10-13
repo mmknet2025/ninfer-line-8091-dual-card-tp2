@@ -1,4 +1,5 @@
 #include "serve/anthropic_schema.h"
+#include "serve/structured_output.h"
 
 #include <array>
 #include <cctype>
@@ -464,14 +465,28 @@ void parse_thinking(const Json& body, GenerationRequest& out) {
     out.enable_thinking    = (type != "disabled");
 }
 
-void parse_output_config(const Json& body, GenerationRequest& out) {
+void parse_output_config(const Json& body, const RequestLimits& limits, GenerationRequest& out) {
     if (!body.contains("output_config") || body.at("output_config").is_null()) { return; }
     const Json& config = body.at("output_config");
     if (!config.is_object()) { bad_request("output_config must be an object", "output_config"); }
     for (auto it = config.begin(); it != config.end(); ++it) {
-        if (it.key() != "effort" && !it.value().is_null()) {
+        if (it.key() != "effort" && it.key() != "format" && !it.value().is_null()) {
             bad_request("output_config." + it.key() + " is not supported", "output_config",
                         "output_config_option_not_supported");
+        }
+    }
+    // output_config.format is the Anthropic Messages structured-output member. It is accepted only
+    // when the server enabled constrained decoding; otherwise the historical rejection stands
+    // (unless --unconstrained-response-format: then the request is generated unconstrained).
+    if (config.contains("format") && !config.at("format").is_null()) {
+        if (!limits.structured_output) {
+            if (!limits.unconstrained_response_format) {
+                bad_request("output_config.format is not supported", "output_config",
+                            "output_config_option_not_supported");
+            }
+        } else {
+            out.structured_output =
+                parse_structured_output(config.at("format"), false, "output_config.format");
         }
     }
     if (!config.contains("effort") || config.at("effort").is_null()) { return; }
@@ -530,7 +545,7 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
     parse_stop_sequences(body, out);
     parse_sampling(body, out);
     parse_thinking(body, out);
-    parse_output_config(body, out);
+    parse_output_config(body, limits, out);
     if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
         if (!body.at("preserve_thinking").is_boolean()) {
             bad_request("preserve_thinking must be a boolean or null", "preserve_thinking");

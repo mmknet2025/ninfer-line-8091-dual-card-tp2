@@ -197,7 +197,18 @@ struct StopPolicy {
     bool publish_stop_token     = false;
 };
 
+// Structured/constrained decoding (ported from the 5258 line). Opt-in: a request carries a
+// constraint only when the server started with --structured-output; the default request path is
+// unchanged. See src/text/structured_output.h for the grammar compiler.
+enum class StructuredOutputKind : std::uint8_t { None, JsonObject, JsonSchema };
+
+struct StructuredOutputOptions {
+    StructuredOutputKind kind = StructuredOutputKind::None;
+    std::string schema; // JSON Schema for JsonSchema, otherwise empty
+};
+
 struct ExecutionOptions {
+    StructuredOutputOptions structured_output;
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;

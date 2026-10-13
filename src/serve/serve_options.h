@@ -59,6 +59,12 @@ struct ServeOptions {
     bool preserve_thinking = false;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
+    // Opt-in constrained decoding. Off (default) preserves the historical request path exactly: a
+    // JSON/JSON Schema response format is refused with the same error code as before.
+    bool structured_output = false;
+    // --unconstrained-response-format: without --structured-output, generate a JSON/JSON Schema
+    // request unconstrained instead of refusing it, for clients that always send a format.
+    bool unconstrained_response_format = false;
     // Process-level explicit overrides layered between registered model/mode defaults and request
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;

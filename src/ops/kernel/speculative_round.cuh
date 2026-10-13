@@ -231,7 +231,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
             const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg,
-                                                    row_drafts, col);
+                                                    row_drafts, col, col);
             keys[item]    = sampling_sort_key(x, v);
         } else {
             keys[item] = 0ull;

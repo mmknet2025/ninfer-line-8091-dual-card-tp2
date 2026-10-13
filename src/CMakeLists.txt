@@ -277,8 +277,12 @@ target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_tma)
 # Product-independent text and media mechanisms.
 add_library(ninfer_text STATIC
   text/unicode.cpp
+  text/structured_output.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
+# The structured-output frontend compiles JSON Schema into XGrammar grammars; the grammar
+# compiler is a static library with no public API surface.
+target_link_libraries(ninfer_text PRIVATE ninfer_xgrammar)
 # utf8proc is compiled into this archive, so its Windows dllexport/dllimport
 # annotations stay off.
 if(WIN32)
@@ -340,6 +344,7 @@ if(NINFER_BUILD_SERVE)
     serve/openai_schema.cpp
     serve/responses_schema.cpp
     serve/anthropic_schema.cpp
+    serve/structured_output.cpp
     serve/response_store.cpp
     serve/tool_call_parser.cpp
     serve/translate.cpp

@@ -126,6 +126,16 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
     return col * kSamplerCandidateCap + j;
 }
 
+// True when token `v` is admissible under an optional constrained-decoding mask. A null mask is
+// the historical unconstrained path: every token is admissible. Column `col` is the speculative
+// draft position; ordinary sampling uses column zero. Bit v is in word v/32 at position v%32.
+__device__ __forceinline__ bool sampling_token_admissible(const SamplingConfig& c, std::int32_t v,
+                                                          std::int32_t col = 0) {
+    if (c.token_mask == nullptr) { return true; }
+    const std::uint32_t* column = c.token_mask + static_cast<std::int64_t>(c.token_mask_stride) * col;
+    return (column[static_cast<std::int32_t>(v) >> 5] & (1U << (v & 31))) != 0U;
+}
+
 // Applies presence/frequency penalties to a raw logit. `overlay`/`overlay_len`
 // carry a round-local count overlay: tokens already committed earlier in the
 // current speculative round but not yet flushed to the global `token_counts`. For speculative
@@ -136,7 +146,11 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
 // only runs when penalties are active, so it is free on the no-penalty path.
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
                                                          const std::int32_t* overlay = nullptr,
-                                                         int overlay_len             = 0) {
+                                                         int overlay_len             = 0,
+                                                         int mask_col                = 0) {
+    // Constrained decoding comes first: an inadmissible token leaves the support regardless of
+    // penalties, temperature or any filter downstream.
+    if (!sampling_token_admissible(c, v, mask_col)) { return -CUDART_INF_F; }
     float x = raw;
     if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f) { return x; }
     int cnt = c.token_counts != nullptr ? c.token_counts[v] : 0;

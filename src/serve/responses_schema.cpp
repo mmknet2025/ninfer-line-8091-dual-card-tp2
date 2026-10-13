@@ -2,6 +2,7 @@
 
 #include "serve/generation_service.h"
 #include "serve/openai_schema.h"
+#include "serve/structured_output.h"
 
 #include <algorithm>
 #include <array>
@@ -689,21 +690,44 @@ void reject_server_managed_features(const Json& body) {
                             "text_option_not_supported");
             }
         }
-        if (body.at("text").contains("format") && !body.at("text").at("format").is_null()) {
-            const Json& format = body.at("text").at("format");
-            if (!format.is_object() || !format.contains("type") || !format.at("type").is_string() ||
-                format.at("type").get<std::string>() != "text") {
+    }
+}
+
+// Maps text.format onto the internal structured-output value. Mirrors the Chat Completions
+// adapter: with --structured-output off, a non-text format is refused with the historical
+// structured_outputs_not_supported code unless --unconstrained-response-format asked for it to be
+// generated unconstrained instead.
+void parse_text_format(const Json& body, const RequestLimits& limits, GenerationRequest& out) {
+    if (!body.contains("text") || body.at("text").is_null()) { return; }
+    const Json& text = body.at("text");
+    if (!text.is_object()) { bad_request("text must be an object", "text"); }
+    for (auto it = text.begin(); it != text.end(); ++it) {
+        if (it.key() != "format" && !it.value().is_null()) {
+            bad_request("text." + it.key() + " is not supported", "text",
+                        "text_option_not_supported");
+        }
+    }
+    if (!text.contains("format") || text.at("format").is_null()) { return; }
+    const Json& format = text.at("format");
+    if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
+        bad_request("only text.format {type:'text'} is supported", "text",
+                    "structured_outputs_not_supported");
+    }
+    if (format.at("type").get<std::string>() == "text") {
+        for (auto it = format.begin(); it != format.end(); ++it) {
+            if (it.key() != "type") {
                 bad_request("only text.format {type:'text'} is supported", "text",
                             "structured_outputs_not_supported");
             }
-            for (auto it = format.begin(); it != format.end(); ++it) {
-                if (it.key() != "type") {
-                    bad_request("only text.format {type:'text'} is supported", "text",
-                                "structured_outputs_not_supported");
-                }
-            }
         }
+        return;
     }
+    if (!limits.structured_output) {
+        if (limits.unconstrained_response_format) { return; } // generate unconstrained
+        bad_request("only text.format {type:'text'} is supported", "text",
+                    "structured_outputs_not_supported");
+    }
+    out.structured_output = parse_structured_output(format, false, "text.format");
 }
 
 ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limits) {
@@ -719,6 +743,7 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
     out.generation.model = body.at("model").get<std::string>();
     if (!body.contains("input")) { bad_request("missing required field: input", "input"); }
     parse_input(body.at("input"), out);
+    parse_text_format(body, limits, out.generation);
 
     if (body.contains("instructions") && !body.at("instructions").is_null()) {
         if (!body.at("instructions").is_string()) {

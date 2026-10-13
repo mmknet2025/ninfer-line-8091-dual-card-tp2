@@ -46,6 +46,13 @@ private:
 // Server-side context needed while parsing/validating a request.
 struct RequestLimits {
     int default_max_tokens = 8192;
+    // Opt-in constrained decoding. Off (the default) keeps the historical behavior: a constrained
+    // response_format/text.format/output_config.format is refused with the same error code as
+    // before. On, the format object is compiled into a grammar the sampler honours.
+    bool structured_output = false;
+    // With structured_output off, generate a JSON/JSON Schema request unconstrained instead of
+    // refusing it (for clients that always send a format and parse the answer themselves).
+    bool unconstrained_response_format = false;
 };
 
 struct CompletionUsage {
@@ -184,6 +191,9 @@ struct GenerationRequest {
     std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;
     SamplingParams sampling;
+    // Opt-in constrained decoding. Set only when the server was started with --structured-output
+    // and the request carried a JSON/JSON Schema response format.
+    StructuredOutputOptions structured_output;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;

@@ -234,6 +234,16 @@ ninfer_add_test(ninfer_response_store_test
 ninfer_add_test(ninfer_anthropic_schema_test
   SOURCES test_anthropic_schema.cpp
   LIBRARIES ninfer_serve)
+# Host-only: no artifact, no device. The opt-in structured-output (constrained decoding) layer:
+# the grammar frontend (JSON Schema -> XGrammar, bounded/unbounded strings, additional properties,
+# numeric ranges, $ref recursion, reasoning envelope) and the serving boundary (default refusal on
+# all three wire formats, --structured-output mapping, --unconstrained-response-format downgrade).
+ninfer_add_test(ninfer_structured_output_test
+  SOURCES test_structured_output.cpp
+  LIBRARIES ninfer_text)
+ninfer_add_test(ninfer_serve_structured_output_test
+  SOURCES test_serve_structured_output.cpp
+  LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_tool_call_parser_test
   SOURCES test_tool_call_parser.cpp
   LIBRARIES ninfer_serve)

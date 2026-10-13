@@ -1,4 +1,5 @@
 #include "serve/openai_schema.h"
+#include "serve/structured_output.h"
 
 #include <array>
 #include <cctype>
@@ -442,19 +443,28 @@ void reject_unsupported_features(const Json& body) {
             throw ApiException(std::move(error));
         }
     }
-    if (body.contains("response_format") && !body.at("response_format").is_null()) {
-        const Json& fmt  = body.at("response_format");
-        std::string type = fmt.is_object() && fmt.contains("type") && fmt.at("type").is_string()
-                               ? fmt.at("type").get<std::string>()
-                               : std::string();
-        if (type != "text") {
-            ApiError error;
-            error.message = "only response_format {type:text} is supported";
-            error.param   = "response_format";
-            error.code    = "response_format_not_supported";
-            throw ApiException(std::move(error));
-        }
+}
+
+// Maps response_format onto the internal structured-output value. With the server's
+// --structured-output switch off this keeps the historical contract exactly: any non-text format
+// is refused with response_format_not_supported, unless --unconstrained-response-format asked for
+// such a request to be generated unconstrained instead.
+void parse_response_format(const Json& body, const RequestLimits& limits, GenerationRequest& out) {
+    if (!body.contains("response_format") || body.at("response_format").is_null()) { return; }
+    const Json& fmt  = body.at("response_format");
+    std::string type = fmt.is_object() && fmt.contains("type") && fmt.at("type").is_string()
+                           ? fmt.at("type").get<std::string>()
+                           : std::string();
+    if (type == "text") { return; }
+    if (!limits.structured_output) {
+        if (limits.unconstrained_response_format) { return; } // generate unconstrained
+        ApiError error;
+        error.message = "only response_format {type:text} is supported";
+        error.param   = "response_format";
+        error.code    = "response_format_not_supported";
+        throw ApiException(std::move(error));
     }
+    out.structured_output = parse_structured_output(fmt, true, "response_format");
 }
 
 Json base_chunk(const std::string& id, const std::string& model, std::int64_t created) {
@@ -548,6 +558,7 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_messages(body, out);
     parse_stop(body, out);
     parse_sampling(body, out);
+    parse_response_format(body, limits, out);
 
     out.stream = get_bool(body, "stream", false);
     if (body.contains("stream_options") && body.at("stream_options").is_object()) {

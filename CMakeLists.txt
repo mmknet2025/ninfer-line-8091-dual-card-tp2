@@ -189,6 +189,10 @@ else()
 endif()
 
 # --- Subdirectories ----------------------------------------------------------
+# Vendored XGrammar v0.2.7 (structured-output grammar compiler/matcher, pure C++, no
+# Python/TVM). EXCLUDE_FROM_ALL: built only because ninfer_text links it. See
+# third_party/xgrammar/NINFER.md for our local correctness patches.
+add_subdirectory(third_party/xgrammar EXCLUDE_FROM_ALL)
 add_subdirectory(src)
 if(NINFER_BUILD_APPS)
   add_subdirectory(apps)
