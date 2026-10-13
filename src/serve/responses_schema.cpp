@@ -697,7 +697,7 @@ void reject_server_managed_features(const Json& body) {
 // adapter: with --structured-output off, a non-text format is refused with the historical
 // structured_outputs_not_supported code unless --unconstrained-response-format asked for it to be
 // generated unconstrained instead.
-void parse_text_format(const Json& body, const RequestLimits& limits, GenerationRequest& out) {
+void parse_text_format(const Json& body, const RequestLimits& limits, ResponsesRequest& out) {
     if (!body.contains("text") || body.at("text").is_null()) { return; }
     const Json& text = body.at("text");
     if (!text.is_object()) { bad_request("text must be an object", "text"); }
@@ -720,6 +720,7 @@ void parse_text_format(const Json& body, const RequestLimits& limits, Generation
                             "structured_outputs_not_supported");
             }
         }
+        out.text_format = format;
         return;
     }
     if (!limits.structured_output) {
@@ -727,7 +728,8 @@ void parse_text_format(const Json& body, const RequestLimits& limits, Generation
         bad_request("only text.format {type:'text'} is supported", "text",
                     "structured_outputs_not_supported");
     }
-    out.structured_output = parse_structured_output(format, false, "text.format");
+    out.generation.structured_output = parse_structured_output(format, false, "text.format");
+    out.text_format                  = format;
 }
 
 ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limits) {
@@ -743,7 +745,7 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
     out.generation.model = body.at("model").get<std::string>();
     if (!body.contains("input")) { bad_request("missing required field: input", "input"); }
     parse_input(body.at("input"), out);
-    parse_text_format(body, limits, out.generation);
+    parse_text_format(body, limits, out);
 
     if (body.contains("instructions") && !body.at("instructions").is_null()) {
         if (!body.at("instructions").is_string()) {
@@ -855,7 +857,7 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"service_tier", "default"},
         {"store", request.store},
         {"temperature", runtime.temperature},
-        {"text", Json{{"format", Json{{"type", "text"}}}}},
+        {"text", Json{{"format", request.text_format}}},
         {"tool_choice", request.tool_choice},
         {"tools", request.tools},
         {"top_logprobs", 0},

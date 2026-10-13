@@ -568,7 +568,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     GenerationRequest request;
     try {
         RequestLimits limits;
-        limits.default_max_tokens = options_.default_max_tokens;
+        limits.default_max_tokens            = options_.default_max_tokens;
+        limits.structured_output             = options_.structured_output;
+        limits.unconstrained_response_format = options_.unconstrained_response_format;
         // The Anthropic endpoint accepts any `model` string (Claude Code sends real
         // Claude model names) and echoes it back; it never 404s on model id.
         request = parse_messages_request(body, limits);

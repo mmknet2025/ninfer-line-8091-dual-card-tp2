@@ -29,6 +29,9 @@ struct ResponsesRequest {
 
     std::optional<std::string> instructions;
     std::optional<std::string> previous_response_id;
+    // text.format accepted from the request, echoed verbatim into the response's text.format.
+    // Defaults to {"type":"text"} so a request that carried no format keeps the historical shape.
+    nlohmann::json text_format = nlohmann::json{{"type", "text"}};
     nlohmann::json metadata    = nlohmann::json::object();
     nlohmann::json tools       = nlohmann::json::array();
     nlohmann::json tool_choice = "auto";
