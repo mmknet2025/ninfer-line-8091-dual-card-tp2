@@ -1383,6 +1383,88 @@ int test_media_preparation_cancellation() {
     return check(false, "cancelled media preparation completed successfully");
 }
 
+// The grammar-side twin of render_tool_call: a constrained request that declares tools offers the
+// model's native <tool_call> serialization beside its JSON schema. The descriptor's exact shape is
+// pinned here, so a silent change to that wire format cannot pass as "still compiles".
+int test_structured_tool_call_format() {
+    int failures = 0;
+    const std::vector<std::string> no_tools;
+    failures += check(fi::structured_tool_call_format(no_tools).empty(),
+                      "no tools produced a non-empty tool-call envelope");
+    const std::vector<std::string> malformed = {R"({"type":"function","function":{"name":"f")"};
+    failures += check(fi::structured_tool_call_format(malformed).empty(),
+                      "a malformed tool definition produced a tool-call envelope");
+
+    const std::vector<std::string> tools = {
+        R"({"type":"function","function":{"name":"f","description":"d","parameters":{"type":"object","properties":{"flag":{"type":"boolean"}}}}})",
+        R"({"type":"function","function":{"name":"g","parameters":{"type":"object","properties":{"alpha":{"type":"string"},"beta":{"type":"string"}}}}})",
+    };
+    const std::string tag          = fi::structured_tool_call_format(tools);
+    const nlohmann::json parsed    = nlohmann::json::parse(tag, nullptr, false);
+    failures += check(!parsed.is_discarded(), "the tool-call envelope is not valid JSON");
+    if (parsed.is_discarded()) { return failures; }
+    failures += check(parsed.dump() == tag, "the tool-call envelope is not canonical JSON");
+
+    const nlohmann::json& elements = parsed.at("elements");
+    failures += check(parsed.at("type") == "sequence" && elements.is_array() &&
+                          elements.size() == 2 && elements.at(0).at("type") == "regex" &&
+                          elements.at(0).at("pattern") == "[ \\t\\r\\n]{0,8}" &&
+                          elements.at(1).at("type") == "plus" &&
+                          elements.at(1).at("content").at("type") == "or" &&
+                          elements.at(1).at("content").at("elements").size() == 2,
+                      "the tool-call envelope has an unexpected top-level shape");
+
+    const nlohmann::json& first =
+        elements.at(1).at("content").at("elements").at(0).at("elements");
+    const nlohmann::json& parameter = first.at(4).at("content").at("elements").at(0);
+    failures +=
+        check(first.is_array() && first.size() == 9 && first.at(0).at("value") == "<tool_call>" &&
+                  first.at(2).at("value") == "<function=f>" && first.at(3).at("type") == "regex" &&
+                  first.at(4).at("type") == "optional" && parameter.at("type") == "tag" &&
+                  parameter.at("begin") == "<parameter=flag>" &&
+                  parameter.at("end") == "</parameter>" &&
+                  parameter.at("content").at("type") == "any_text" &&
+                  parameter.at("content").at("excludes") ==
+                      nlohmann::json::array({"</parameter>", "<parameter=", "</function>",
+                                             "<tool_call>", "</tool_call>"}) &&
+                  first.at(5).at("value") == "</function>" && first.at(6).at("type") == "regex" &&
+                  first.at(7).at("value") == "</tool_call>",
+              "the first tool's envelope does not carry <function=f> and its parameter");
+
+    const nlohmann::json& second =
+        elements.at(1).at("content").at("elements").at(1).at("elements");
+    failures += check(second.is_array() && second.size() == 10 &&
+                          second.at(2).at("value") == "<function=g>" &&
+                          second.at(4).at("content").at("elements").at(0).at("begin") ==
+                              "<parameter=alpha>" &&
+                          second.at(5).at("content").at("elements").at(0).at("begin") ==
+                              "<parameter=beta>",
+                      "the second tool's envelope lost its name or parameter order");
+
+    // The same tool declared twice describes the same call and stays one alternative.
+    const std::vector<std::string> duplicated = {tools.at(0), tools.at(0)};
+    failures += check(fi::structured_tool_call_format(duplicated) == tag,
+                      "a repeated identical tool definition changed the tool-call envelope");
+    failures += check(
+        throws_invalid_argument([&] {
+            const std::vector<std::string> ambiguous = {
+                R"({"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"a":{"type":"string"}}}}})",
+                R"({"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"b":{"type":"string"}}}}})",
+            };
+            (void)fi::structured_tool_call_format(ambiguous);
+        }),
+        "two different tools sharing a name produced a tool-call envelope");
+    failures += check(
+        throws_invalid_argument([&] {
+            const std::vector<std::string> bad_name = {
+                R"({"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"a>b":{"type":"string"}}}}})",
+            };
+            (void)fi::structured_tool_call_format(bad_name);
+        }),
+        "a parameter name Qwen XML cannot carry produced a tool-call envelope");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1392,6 +1474,7 @@ int main() {
     failures += test_official_tokenizer_merge();
     failures += test_repeated_special_tokens_scan_linearly();
     failures += test_official_chat_template();
+    failures += test_structured_tool_call_format();
     failures += test_ordered_instruction_turns();
     failures += test_reasoning_effort_chat_template();
     failures += test_rewrite_checkpoint_trace();

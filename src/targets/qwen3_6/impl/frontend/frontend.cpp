@@ -974,6 +974,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     (void)checked_token_count(result.token_ids.size());
     result.identity.reusable   = true;
     result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
+    // The render already turned these into prompt tokens; keeping the definitions lets the grammar
+    // frontend compile the same tools' native envelope without a second copy that could disagree.
+    result.tool_jsons          = options.tool_jsons;
     result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
@@ -1068,11 +1071,15 @@ Frontend::compile_structured_output(const PreparedPrompt& prompt,
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     text::validate_structured_output(structured);
     if (structured.kind == StructuredOutputKind::None) { return nullptr; }
-    // The model's own framing around the constrained span. This target has no tool-call
-    // serialization contract yet, so the only envelope term that exists is the reasoning close
-    // when the prompt ends inside a reasoning block.
+    // The model's own framing around the constrained span: the reasoning close when the prompt ends
+    // inside a reasoning block, and — when the request declared tools — the model's native
+    // tool-call envelope beside the schema. Offering the envelope is what keeps a constrained
+    // request that also carries tools able to answer with a tool turn; without it the schema alone
+    // owns every sampled token and the model can only emit the JSON body. A request without tools
+    // leaves the envelope's second term empty and constrains the schema exactly as before.
     text::StructuredOutputEnvelope envelope;
     if (prompt.data_->starts_in_reasoning) { envelope.reasoning_close = std::string(kThinkClose); }
+    envelope.alternative_format = fi::structured_tool_call_format(prompt.data_->tool_jsons);
     std::lock_guard lock(impl_->grammar_mutex);
     if (!impl_->grammar_compiler) {
         const fi::Tokenizer& tokenizer = *impl_->tokenizer;

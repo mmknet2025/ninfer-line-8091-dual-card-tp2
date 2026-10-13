@@ -103,6 +103,11 @@ struct PreparedPromptData {
     std::vector<VisionItem> vision_items;
     PromptIdentity identity;
     bool starts_in_reasoning = false;
+    // The normalized function-tool definitions the render consumed, in render order. Retained so
+    // the grammar frontend can offer the model's native tool-call envelope beside a requested JSON
+    // schema (the 5258 line keeps the equivalent `tool_call_output` contract here). Empty when the
+    // request declared no tools, which leaves every constrained request's envelope unchanged.
+    std::vector<std::string> tool_jsons;
     PrepareStats prepare;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;

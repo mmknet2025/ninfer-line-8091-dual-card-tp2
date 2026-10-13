@@ -4,11 +4,15 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cctype>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6::frontend_internal {
 namespace {
@@ -202,6 +206,59 @@ std::string render_tool_call(const ToolCall& call, bool allow_empty_arguments) {
     return rendered;
 }
 
+// One tool of the native envelope: the name Qwen's opener carries, and the parameter names it may
+// tag, in declaration order (mirrors the 5258 line's ToolCallOutputContract::Tool).
+struct ToolCallEnvelope {
+    std::string name;
+    std::vector<std::string> parameters;
+};
+
+std::vector<ToolCallEnvelope>
+collect_tool_call_envelopes(std::span<const std::string> tool_jsons) {
+    std::vector<ToolCallEnvelope> tools;
+    tools.reserve(tool_jsons.size());
+    for (const std::string& tool_json : tool_jsons) {
+        const OrderedJson definition = OrderedJson::parse(tool_json, nullptr, false);
+        if (!definition.is_object()) { continue; }
+        const auto function = definition.find("function");
+        if (function == definition.end() || !function->is_object()) { continue; }
+        const auto name = function->find("name");
+        if (name == function->end() || !name->is_string() || name->get_ref<const std::string&>().empty()) {
+            continue;
+        }
+        ToolCallEnvelope tool;
+        tool.name             = name->get<std::string>();
+        const auto parameters = function->find("parameters");
+        if (parameters != function->end() && parameters->is_object()) {
+            const auto properties = parameters->find("properties");
+            if (properties != parameters->end() && properties->is_object()) {
+                tool.parameters.reserve(properties->size());
+                for (auto it = properties->begin(); it != properties->end(); ++it) {
+                    if (it.key().empty() || it.key().find('>') != std::string::npos) {
+                        throw std::invalid_argument(
+                            "tool parameter cannot be represented in Qwen XML");
+                    }
+                    tool.parameters.push_back(it.key());
+                }
+            }
+        }
+        const auto existing =
+            std::find_if(tools.begin(), tools.end(),
+                         [&](const ToolCallEnvelope& other) { return other.name == tool.name; });
+        if (existing == tools.end()) {
+            tools.push_back(std::move(tool));
+            continue;
+        }
+        // A second definition of the same name has to describe the same call, or the grammar would
+        // have to guess which one the model meant (the 5258 line refuses this too).
+        if (existing->parameters != tool.parameters) {
+            throw std::invalid_argument(
+                "structured output requires unambiguous tool definitions");
+        }
+    }
+    return tools;
+}
+
 std::string render_tools_system_block(const std::vector<std::string>& tool_jsons,
                                       const std::string& leading_instruction,
                                       std::string_view reasoning_instructions) {
@@ -254,6 +311,59 @@ std::string_view resolve_reasoning_instructions(ChatTemplateSemantics semantics,
 }
 
 } // namespace
+
+std::string structured_tool_call_format(std::span<const std::string> tool_jsons) {
+    constexpr std::string_view kToolOpen      = "<tool_call>";
+    constexpr std::string_view kToolClose     = "</tool_call>";
+    constexpr std::string_view kFunctionOpen  = "<function=";
+    constexpr std::string_view kFunctionClose = "</function>";
+    constexpr std::string_view kParamOpen     = "<parameter=";
+    constexpr std::string_view kParamClose    = "</parameter>";
+    // Qwen separates the envelope's parts with whitespace; the canonical rendering uses one
+    // newline each, and a bounded run keeps a stray blank line representable too.
+    const OrderedJson whitespace{{"type", "regex"}, {"pattern", "[ \\t\\r\\n]{0,8}"}};
+    const auto literal = [](std::string text) {
+        return OrderedJson{{"type", "const_string"}, {"value", std::move(text)}};
+    };
+    const std::vector<ToolCallEnvelope> tools = collect_tool_call_envelopes(tool_jsons);
+    if (tools.empty()) { return {}; }
+    OrderedJson alternatives = OrderedJson::array();
+    for (const ToolCallEnvelope& tool : tools) {
+        OrderedJson elements =
+            OrderedJson::array({literal(std::string(kToolOpen)), whitespace,
+                                literal(std::string(kFunctionOpen) + tool.name + ">"), whitespace});
+        for (const std::string& parameter : tool.parameters) {
+            // Untyped text, exactly as the renderer writes it: everything up to the next tag.
+            const OrderedJson excluded = OrderedJson::array(
+                {std::string(kParamClose), std::string(kParamOpen), std::string(kFunctionClose),
+                 std::string(kToolOpen), std::string(kToolClose)});
+            const OrderedJson value{{"type", "any_text"}, {"excludes", excluded}};
+            const OrderedJson tagged{{"type", "tag"},
+                                     {"begin", std::string(kParamOpen) + parameter + ">"},
+                                     {"content", value},
+                                     {"end", std::string(kParamClose)}};
+            elements.push_back(OrderedJson{
+                {"type", "optional"},
+                {"content", OrderedJson{{"type", "sequence"},
+                                        {"elements", OrderedJson::array({tagged, whitespace})}}}});
+        }
+        elements.push_back(literal(std::string(kFunctionClose)));
+        elements.push_back(whitespace);
+        elements.push_back(literal(std::string(kToolClose)));
+        elements.push_back(whitespace);
+        alternatives.push_back(
+            OrderedJson{{"type", "sequence"}, {"elements", std::move(elements)}});
+    }
+    // One or more calls, optionally preceded by whitespace (a reasoning close leaves a newline).
+    return OrderedJson{
+        {"type", "sequence"},
+        {"elements",
+         OrderedJson::array(
+             {whitespace, OrderedJson{{"type", "plus"},
+                                      {"content", OrderedJson{{"type", "or"},
+                                                              {"elements", std::move(alternatives)}}}}})}}
+        .dump();
+}
 
 bool ChatMessage::has_media() const noexcept {
     for (const ChatPart& part : parts) {

@@ -1,4 +1,5 @@
 #include "serve/translate.h"
+#include "serve/structured_output.h"
 
 #include <cmath>
 #include <cstdint>
@@ -227,6 +228,11 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.preserve_thinking     = semantics.preserve_thinking;
     input.options.add_vision_id         = false;
     input.options.tool_jsons            = effective_tool_jsons(request);
+    // A constrained request carries the schema as prompt-level policy too: the grammar bounds what
+    // the model may emit, and this tells it what the bounded answer should be — in particular that
+    // tools stay available for gathering information but a tool turn is not how the final answer is
+    // formatted. Applied last, so it sees the tools that actually reached the prompt.
+    apply_structured_output_instruction(input, request.structured_output);
     return input;
 }
 

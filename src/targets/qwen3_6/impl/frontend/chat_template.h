@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -107,5 +108,15 @@ private:
 
     ChatTemplateSemantics semantics_;
 };
+
+// The model's native tool-call turn, expressed as an XGrammar structural-tag descriptor. This is
+// the grammar-side twin of `render_tool_call`: it admits exactly the `<tool_call>` blocks that
+// function renders, one or more of them, for the tools the request declared. A constrained request
+// that carries tools offers this BESIDE the requested JSON schema, so a tool turn stays a tool turn
+// instead of the schema swallowing it. Empty when no tool definition is representable. Throws
+// std::invalid_argument for a parameter name Qwen's XML cannot carry, or when two tools share a
+// name with different parameters (the call would be ambiguous). Ported from the 5258 line's
+// `frontend::structured_tool_call_format`.
+[[nodiscard]] std::string structured_tool_call_format(std::span<const std::string> tool_jsons);
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

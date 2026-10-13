@@ -48,4 +48,33 @@ StructuredOutputOptions parse_structured_output(const nlohmann::json& format, bo
     } catch (const std::invalid_argument& e) { fail(e.what()); }
     return options;
 }
+
+void apply_structured_output_instruction(ninfer::PromptInput& input,
+                                         const ninfer::StructuredOutputOptions& options) {
+    if (options.kind == StructuredOutputKind::None) { return; }
+    ninfer::MessagePart instruction;
+    instruction.text =
+        "\n\nThe response format is JSON. Return the final answer as raw JSON without Markdown "
+        "fences or surrounding text.";
+    if (!input.options.tool_jsons.empty()) {
+        instruction.text +=
+            " Tool calls remain available when needed to obtain information; do not call tools "
+            "merely to format JSON.";
+    }
+    if (options.kind == StructuredOutputKind::JsonSchema) {
+        instruction.text += "\nThe final answer must match this JSON Schema:\n" + options.schema;
+    } else {
+        instruction.text += " The final answer must be a JSON object.";
+    }
+    if (!input.messages.empty() && (input.messages.front().role == ninfer::ChatRole::System ||
+                                    input.messages.front().role == ninfer::ChatRole::Developer)) {
+        // Append a part so explicit boundaries inside the caller's instruction stay unchanged.
+        input.messages.front().parts.push_back(std::move(instruction));
+        return;
+    }
+    ninfer::ChatMessage system;
+    system.role = ninfer::ChatRole::System;
+    system.parts.push_back(std::move(instruction));
+    input.messages.insert(input.messages.begin(), std::move(system));
+}
 } // namespace ninfer::serve
